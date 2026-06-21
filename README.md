@@ -1,200 +1,183 @@
-# ブログアプリにおける設計上の工夫と実装内容の一部抜粋
+# ブログアプリにおける設計上の工夫と実装内容（一部抜粋）
+
+個人開発のブログアプリケーションから、**将来的な負荷増加を想定した設計上の工夫**を行った箇所を一部抜粋したものです。  
+機能実装のみにとどまらず、運用後のデータ増加・アクセス増加に耐えられる構成を意識して開発しました。
+
+---
+
+## 目次
+
+1. [記事とハッシュタグの関連付け設計とデータ取得最適化](#①-記事とハッシュタグの関連付け設計とデータ取得最適化)
+2. [トップページの記事表示制御と閲覧体験の最適化](#②-トップページの記事表示制御と閲覧体験の最適化)
+
+---
 
 ## ① 記事とハッシュタグの関連付け設計とデータ取得最適化
 
-### 該当箇所
+### 対象ファイル
 
-バックエンドのデータモデル定義
-
-```python
-user = db.relationship(
-    'User',
-    backref=db.backref(
-        'posts',
-        lazy=True
-    )
-)
-
-hashtags = db.relationship(
-    'Hashtag',
-    secondary=post_hashtags,
-    lazy='selectin',
-    backref=db.backref(
-        'posts',
-        lazy=True
-    )
-)
-```
+`models.py`
 
 ### 担当している機能
 
 ブログ記事の投稿・一覧表示・タグ検索機能を支えるデータ取得処理です。
 
-具体的には、
+- 管理者と記事を紐づける機能
+- 記事へ複数タグを付与する機能
+- タグから関連記事を検索する機能
+- 一覧画面で記事とタグを同時表示する機能
 
-* 管理者と記事を紐づける機能
-* 記事へ複数タグを付与する機能
-* タグから関連記事を検索する機能
-* 一覧画面で記事とタグを同時表示する機能
-
-を実現しています。
-
-例
+1つの記事に複数のタグが付与できる構造になっています。
 
 ```plaintext
-記事A → hashtag1、hashtag2
-記事B → hashtag3、hashtag4
-記事C → hashtag5、hashtag6、hashtag7
+記事A → hashtag1, hashtag2
+記事B → hashtag3, hashtag4
+記事C → hashtag5, hashtag6, hashtag7
 ```
 
-このように、一つの記事に複数タグが付与できる構造です。
-
----
-
-### 設計上の工夫
-
-通常、一覧ページで記事を10件表示すると、
-
-```plaintext
-記事取得 1回
-↓
-記事ごとにタグ取得 10回
-↓
-合計11回アクセス
-```
-
-という不要なアクセスが発生する可能性があります。
-
-そこで、
+### 該当コード
 
 ```python
-lazy='selectin'
+# models.py（Post モデル内）
+
+# 管理者と記事の紐づけ（多対一）
+user = db.relationship(
+    'User',
+    backref=db.backref('posts', lazy=True)
+)
+
+# 記事とハッシュタグの紐づけ（多対多）
+hashtags = db.relationship(
+    'Hashtag',
+    secondary=post_hashtags,   # 中間テーブルを経由
+    lazy='selectin',           # ← 設計上の工夫箇所
+    backref=db.backref('posts', lazy=True)
+)
 ```
 
-を採用しました。
+### 設計上の工夫：`lazy='selectin'` の採用
 
-この設定では、記事一覧取得後に必要なタグをまとめて取得します。
+記事の一覧を取得するとき、**タグをどのタイミングで取得するか**が設計上の重要な判断点でした。
+
+デフォルト設定（`lazy='select'`）では、各記事ごとに個別のクエリが発行される **N+1 問題**が発生します。
 
 ```plaintext
-記事取得 1回
-↓
-タグまとめ取得 1回
-↓
-合計2回アクセス
+【N+1 問題が発生するケース】
+記事取得     … 1回
+記事1のタグ取得 … 1回
+記事2のタグ取得 … 1回
+     ︙
+記事10のタグ取得 … 1回
+─────────────────
+合計          … 11回のDBアクセス
 ```
 
-その結果、記事数が増えても表示速度が低下しにくく、運用後の拡張性を考慮した設計を実現しました。
+記事数が増えるほどアクセス回数が増え、表示速度の低下につながります。
+
+そこで `lazy='selectin'` を採用しました。この設定では、記事一覧の取得後に **必要なタグをまとめて1回のクエリで取得**します（IN句を使ったバッチ取得）。
+
+```plaintext
+【selectin を採用した場合】
+記事取得（全件） … 1回
+タグ取得（全件） … 1回（IN句でまとめて取得）
+─────────────────
+合計             … 2回のDBアクセス（記事数によらず一定）
+```
+
+この設計により、**記事数が増加しても DBアクセス回数が一定**に保たれ、運用後の拡張にも耐えやすい構成を実現しました。
 
 ---
 
 ## ② トップページの記事表示制御と閲覧体験の最適化
 
-### 該当箇所
+### 対象ファイル
 
-トップページの一覧表示制御
-
-```javascript
-(function () {
-    var INITIAL = 1;
-    var STEP = 5;
-
-    var cards =
-        Array.from(
-            document.querySelectorAll(
-                '.page-wrapper > article.post-card'
-            )
-        );
-
-    var total = cards.length;
-    var shown = 0;
-
-    function showCards(n) {
-        var end =
-            Math.min(
-                shown + n,
-                total
-            );
-
-        for (
-            var i = shown;
-            i < end;
-            i++
-        ) {
-            cards[i].style.display = '';
-        }
-
-        shown = end;
-        updateBtn();
-    }
-
-    function hideCards(n) {
-        var end =
-            Math.max(
-                shown - n,
-                INITIAL
-            );
-
-        for (
-            var i = end;
-            i < shown;
-            i++
-        ) {
-            cards[i].style.display = 'none';
-        }
-
-        shown = end;
-        updateBtn();
-    }
-
-    showCards(INITIAL);
-
-})();
-```
+`templates/index.html`（JavaScript 部分）
 
 ### 担当している機能
 
-トップページの記事一覧表示です。
+トップページの記事一覧表示を制御する機能です。
 
-仕様
+- 初回表示は最新記事を1件のみ表示
+- 「もっと見る」ボタンで5件ずつ追加表示
+- 「表示を減らす」ボタンで元に戻せる
 
-* 初回表示は最新記事1件のみ表示
-* 「もっと見る」で5件ずつ追加表示
-* 「表示を減らす」で戻せる
-
----
-
-### 設計上の工夫
-
-記事数が増えた場合、初回アクセス時に全件描画すると、
-
-* 初期表示が遅くなる
-* ユーザが情報過多になる
-* モバイル端末で操作性が下がる
-
-という課題があります。
-
-そこで、表示制御をJavaScript側へ分離し、
+### 該当コード
 
 ```javascript
-var INITIAL = 1;
-var STEP = 5;
+// templates/index.html より抜粋
+
+(function () {
+    var INITIAL = 1;  // 初期表示件数
+    var STEP    = 5;  // 追加・削除の単位件数
+
+    var cards = Array.from(
+        document.querySelectorAll('.page-wrapper > article.post-card')
+    );
+    var total = cards.length;
+    var shown = 0;
+
+    // カードを n 件追加表示する
+    function showCards(n) {
+        var end = Math.min(shown + n, total);
+        for (var i = shown; i < end; i++) {
+            cards[i].style.display = '';
+        }
+        shown = end;
+        updateBtn();
+    }
+
+    // カードを n 件非表示に戻す
+    function hideCards(n) {
+        var end = Math.max(shown - n, INITIAL);
+        for (var i = end; i < shown; i++) {
+            cards[i].style.display = 'none';
+        }
+        shown = end;
+        updateBtn();
+    }
+
+    // 初回は INITIAL 件だけ表示
+    showCards(INITIAL);
+})();
 ```
 
-として段階的表示を採用しました。
+### 設計上の工夫：段階的表示による初期ロードの軽量化
 
-結果として、
+記事数が増えた場合に全件を初回描画すると、以下の問題が予想されました。
+
+- 初回アクセス時の描画コストが増大し、表示が遅くなる
+- スクロールが長くなりユーザーが情報過多になる
+- モバイル端末での操作性が低下する
+
+この課題に対し、**表示制御をサーバーサイドのページネーションではなく JavaScript 側で実装**することで、以下の利点を得ました。
+
+- サーバーへの追加リクエストなしに表示件数を増減できる
+- ページ遷移がなくスムーズな操作感を維持できる
+- `INITIAL` と `STEP` の定数を変更するだけで表示仕様を柔軟に調整できる
 
 ```plaintext
-初回表示
-↓
-必要な分だけ追加表示
-↓
-快適な閲覧体験
+初回表示（1件）
+  ↓  「もっと見る」をタップ
++5件表示（合計6件）
+  ↓  「もっと見る」をタップ
++5件表示（合計11件）
+  ↓  「表示を減らす」をタップ
+−5件表示（合計6件）
 ```
 
-を実現しています。
+記事数が今後増加しても、**ユーザーの操作に応じて段階的に読み込む**ことで、快適な閲覧体験を維持できる設計にしました。
 
 ---
+
+## まとめ
+
+| 工夫した箇所 | 想定したリスク | 採用した対策 |
+|---|---|---|
+| ハッシュタグの取得方法 | 記事数増加による N+1 問題（DBアクセス増大） | `lazy='selectin'` でバッチ取得に変更 |
+| トップページの記事表示 | 記事数増加による初期描画の遅延・操作性低下 | JavaScript による段階的表示を採用 |
+
+いずれも「現時点の課題」ではなく、**将来の利用増加を想定した先回りの設計**として取り組んだ工夫です。
 
 
 
